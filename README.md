@@ -302,19 +302,36 @@ final class UserCheckerTest extends TestCase
   * Возвращаемое значение репозитория: Объекты сущностей или массив строк из таблицы MySQL.
 * **Задача теста**: Изолировать сервис от реального сервера MySQL с помощью Мок-объекта (`Mock`), задав заранее заготовленный ответ базы данных.
 
+### Контракт репозитория: интерфейс (`src/Repositories/UserRepositoryInterface.php`)
+
+> 💡 **Почему интерфейс, а не класс?** Мокирование интерфейса — лучшая практика SOLID (принцип инверсии зависимостей). `createMock()` гарантирует, что мок реализует ровно те методы, которые задекларированы в контракте, и сервис не привязан к конкретной реализации (MySQL, Redis, массив и т.д.).
+
+```php
+<?php
+namespace App\Repositories; // 👈 Замените на namespace вашего слоя репозиториев
+
+use App\Models\User;
+
+interface UserRepositoryInterface // 👈 Создайте этот интерфейс рядом с вашим классом репозитория
+{
+    public function findById(int $id): ?User;
+}
+```
+
+> **Адаптация**: Добавьте `implements UserRepositoryInterface` к вашему реальному классу репозитория (`UserRepository`, `OrderDb`, `ProductMapper` и т.д.), который работает с MySQL.
+
 ### Бизнес-сервис (`src/Services/UserService.php`)
 ```php
 <?php
 namespace App\Services;
 
-use App\Models\User;
-use App\Repositories\UserRepository; // 👈 Замените на класс вашего слоя работы с БД
+use App\Repositories\UserRepositoryInterface; // 👈 Зависимость от интерфейса, а не класса
 
 class UserService
 {
-    private UserRepository $repository;
+    private UserRepositoryInterface $repository; // 👈 Тип — интерфейс
 
-    public function __construct(UserRepository $repository)
+    public function __construct(UserRepositoryInterface $repository)
     {
         $this->repository = $repository;
     }
@@ -336,7 +353,7 @@ class UserService
 namespace Tests\Unit\Services;
 
 use App\Models\User;
-use App\Repositories\UserRepository; // 👈 Класс/интерфейс вашего репозитория для мокинга
+use App\Repositories\UserRepositoryInterface; // 👈 Мокируем ИНТЕРФЕЙС, а не конкретный класс
 use App\Services\UserService;
 use PHPUnit\Framework\TestCase;
 
@@ -344,21 +361,33 @@ final class UserServiceTest extends TestCase
 {
     public function testGetUserNameByIdReturnsCorrectName(): void
     {
-        // 1. Создаем мок класса репозитория (вместо реального вызова MySQL)
-        $mockRepo = $this->createMock(UserRepository::class);
+        // 1. Создаем мок ИНТЕРФЕЙСА репозитория — PHPUnit гарантирует соответствие контракту
+        $mockRepo = $this->createMock(UserRepositoryInterface::class);
 
-        // 2. Настраиваем ожидание: метод 'findById' вызовется 1 раз с ID=10 и вернет готовую модель
+        // 2. Настраиваем ожидание: findById вызовется 1 раз с ID=10 и вернет готовую модель
         $mockRepo->expects($this->once())
             ->method('findById')
             ->with(10)
             ->willReturn(new User('Мария', 'maria@test.ru'));
 
-        // 3. Внедряем мок в ваш сервис через конструктор
+        // 3. Внедряем мок в сервис через конструктор (Dependency Injection)
         $service = new UserService($mockRepo);
 
-        // 4. Вызываем тестируемый метод сервиса
+        // 4. Вызываем тестируемый метод и проверяем результат
         $name = $service->getUserNameById(10);
         $this->assertSame('Мария', $name);
+    }
+
+    public function testGetUserNameByIdThrowsWhenUserNotFound(): void
+    {
+        $mockRepo = $this->createMock(UserRepositoryInterface::class);
+        $mockRepo->method('findById')->willReturn(null); // Репозиторий возвращает null
+
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('Пользователь не найден');
+
+        $service = new UserService($mockRepo);
+        $service->getUserNameById(999);
     }
 }
 ```
@@ -457,15 +486,51 @@ final class UserControllerTest extends TestCase
 🔍 **Руководство по адаптации под вашу структуру проекта:**
 * Укажите путь к вашей директории с тестами в методе `$runner->run(['phpunit', '--colors=never', 'путь/к/вашим/тестам'])`.
 
+> ⚠️ **Безопасность**: Перед загрузкой на хостинг обязательно:
+> 1. Сгенерируйте уникальный токен: `php -r "echo bin2hex(random_bytes(24));"` и задайте его ниже.
+> 2. После проверки удалите `run-tests.php` с сервера.
+
 ```php
 <?php
-// Веб-скрипт запуска тестов
+// run-tests.php — безопасный веб-раннер тестов PHPUnit
+// ⚠️ УДАЛИТЕ этот файл с хостинга сразу после использования!
+//    Запуск: https://example.com/run-tests.php?token=ВАШ_ТОКЕН
+
+// 1. Задайте свой токен (php -r "echo bin2hex(random_bytes(24));")
+define('RUN_TOKEN', 'замените_на_свой_сгенерированный_токен_здесь');
+
+// 2. Защита: hash_equals предотвращает timing-атаки на сравнение строк
+if (
+    empty($_GET['token'])
+    || !hash_equals(RUN_TOKEN, (string) $_GET['token'])
+) {
+    http_response_code(403);
+    header('Content-Type: text/html; charset=utf-8');
+    exit('<h1>403 Forbidden</h1><p>Укажите корректный токен в параметре <code>?token=...</code></p>');
+}
+
 require_once __DIR__ . '/vendor/autoload.php';
 
-if (isset($_GET['run'])) {
-    $runner = new PHPUnit\TextUI\Application();
-    $runner->run(['phpunit', '--colors=never', 'tests']);
-}
+// 3. Буферизируем вывод ДО запуска: PHPUnit вызывает exit() внутри run(),
+//    поэтому вывод перехватываем через shutdown-функцию.
+ob_start();
+
+register_shutdown_function(function (): void {
+    $output = ob_get_clean();
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!DOCTYPE html><html lang="ru"><head>';
+    echo '<meta charset="UTF-8"><title>PHPUnit Results</title>';
+    echo '<style>body{margin:0;background:#1e1e1e;color:#d4d4d4;font-family:monospace;}';
+    echo 'pre{padding:1.5em;font-size:13px;line-height:1.6;white-space:pre-wrap;word-break:break-all;}';
+    echo '</style></head><body><pre>';
+    echo htmlspecialchars((string) $output, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    echo '</pre></body></html>';
+});
+
+// 4. Запускаем PHPUnit (замените 'tests' на путь к вашей директории с тестами)
+$argv = ['phpunit', '--colors=never', 'tests'];
+$runner = new PHPUnit\TextUI\Application();
+$runner->run($argv);
 ```
 
 ---
@@ -547,21 +612,102 @@ vendor/bin/phpunit --coverage-text --fail-on-low-coverage
 
 ### 10.2. Способ 2: Запуск через PHP-скрипт
 
-1. Используйте PHP-скрипт для вызова выполнения команды генерации.
-2. После работы обязательно удалите временные скрипты с хостинга.
+> ⚠️ **Безопасность**: загружайте этот скрипт только на время обновления и удаляйте сразу после!
+
+```php
+<?php
+// composer-dump.php — временный скрипт генерации карты автозагрузки
+// ⚠️ УДАЛИТЕ этот файл с хостинга сразу после использования!
+
+$projectRoot = __DIR__;
+$composerPhar = $projectRoot . '/composer.phar';
+
+// Если composer.phar отсутствует — скачиваем установщик и запускаем его
+if (!file_exists($composerPhar)) {
+    $installerUrl  = 'https://getcomposer.org/installer';
+    $installerPath = sys_get_temp_dir() . '/composer-setup.php';
+    file_put_contents($installerPath, file_get_contents($installerUrl));
+    passthru("php $installerPath --install-dir=" . escapeshellarg($projectRoot) . ' --filename=composer.phar');
+}
+
+// Устанавливаем домашний каталог Composer во временную папку (нет прав на ~/.composer)
+putenv('COMPOSER_HOME=' . sys_get_temp_dir() . '/.composer');
+chdir($projectRoot);
+
+// Запускаем dump-autoload -o (оптимизированный classmap)
+ob_start();
+passthru('php composer.phar dump-autoload -o 2>&1', $exitCode);
+$output = ob_get_clean();
+
+header('Content-Type: text/html; charset=utf-8');
+echo '<pre style="background:#1e1e1e;color:#d4d4d4;padding:1em;font-family:monospace;">';
+echo htmlspecialchars((string) $output, ENT_QUOTES, 'UTF-8');
+echo "\nExit code: $exitCode";
+echo '</pre>';
+
+// Опционально: самоудаление скрипта после выполнения
+// unlink(__FILE__);
+```
 
 ---
 
 ### 10.3. Способ 3: Использование Web-терминала панели хостинга
 
-1. Откройте Web-Shell или Терминал в панели управления хостингом.
-2. Выполните команду `composer dump-autoload -o`.
+1. Откройте **Web-Shell** или **Terminal** в панели управления хостингом (cPanel → Terminal, ISPmanager → Shell, Plesk → SSH Terminal и т.д.).
+2. Перейдите в корень проекта командой `cd` и выполните команду ниже.
+
+```bash
+# Перейдите в корень проекта (путь зависит от хостинга)
+cd ~/public_html          # cPanel
+# cd /var/www/html/myapp  # ISPmanager / Plesk
+
+# Обновляем карту автозагрузки (-o = оптимизированный classmap)
+composer dump-autoload -o
+
+# Проверяем, что файл обновился (дата изменения)
+ls -la vendor/composer/autoload_classmap.php
+```
 
 ---
 
 ### 10.4. Способ 4: Кастомный автозагрузчик
 
-1. Подключите резервную функцию автозагрузки при отсутствии Composer CLI.
+Применяется как **крайняя мера** при полном отсутствии доступа к Composer — например, при тестировании на хостинге с устаревшим PHP или заблокированным `passthru()`.
+
+```php
+<?php
+// custom_autoload.php — резервный PSR-4-совместимый автозагрузчик без Composer CLI
+// Подключите в bootstrap ВМЕСТО или ДОПОЛНИТЕЛЬНО к vendor/autoload.php:
+//   require_once __DIR__ . '/custom_autoload.php';
+
+spl_autoload_register(function (string $className): void {
+    // Карта пространств имён → базовых директорий
+    // 👈 Отредактируйте под вашу структуру (аналог секции autoload в composer.json)
+    $namespaceMap = [
+        'App\\'     => __DIR__ . '/src/',
+        'Core\\'    => __DIR__ . '/app/Core/',
+        'Classes\\' => __DIR__ . '/classes/',
+        'Tests\\'   => __DIR__ . '/tests/',
+    ];
+
+    foreach ($namespaceMap as $prefix => $baseDir) {
+        if (!str_starts_with($className, $prefix)) {
+            continue;
+        }
+        // Преобразуем разделители пространства имён в разделители пути файловой системы
+        $relativeClass = substr($className, strlen($prefix));
+        $file = $baseDir . str_replace('\\', DIRECTORY_SEPARATOR, $relativeClass) . '.php';
+
+        if (file_exists($file)) {
+            require_once $file;
+            return;
+        }
+    }
+    // Класс не найден — автозагрузчик не выбрасывает исключение; PHP сделает это сам.
+});
+```
+
+> **Ограничение**: этот подход не поддерживает `classmap`-записи Composer и не загружает зависимости из `vendor/`. Используйте его только для ваших собственных классов, но не для зависимостей.
 
 ---
 
